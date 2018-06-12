@@ -4,38 +4,84 @@ import argparse
 import falcon
 from ConnectionObserver import ConnectionObserver
 from ResourceHandlers import ConnectionResource, ConnectionIdResource
-from ConnectionStateStorage import ConnectionStateStorage
+from ConnectionStateStorage import ConnectionStateStorage, ConnectionStorage
 from waitress import serve
+from threading import Lock
 
-def get_hosts(args):
-    hosts = args.strip().split(",")
-    hosts = map(lambda s: s.split(":"), hosts)
-    hosts = map(lambda x: (x[0], int(x[1])), hosts)
-    return hosts
+def get_address(args):
+    hosts = args.strip().split(":")
+    ip, port = hosts[0], int(hosts[1])
+    return ip, port
 
 def get_args():
     parser = argparse.ArgumentParser(description='Service for check connection availability')
-    parser.add_argument('-c', '--connection', type=str, help='Connection endpoint list', required=True)
-    return parser.parse_args().connection
+    parser.add_argument('-s', '--serve', type=str, help='Listen server address', required=True)
+    return parser.parse_args().serve
+
+class HealthChecker:
+    def __init__(self):
+        self._observer = ConnectionObserver()
+        self._state = ConnectionStateStorage()
+        self._storage = ConnectionStorage()
+        self._mutex = Lock()
+
+    def start(self):
+        self._observer.start(self._state.SetHostState)
+
+    def stop(self):
+        self._observer.stop()
+
+    def addHost(self, ip, port):
+        with self._mutex:
+            self._storage.addHost(ip, port)
+            self._state.addHost(ip, port)
+            self._observer.addHost(ip, port)
+        
+    def deleteHost(self, id):
+        with self._mutex:
+            ip, port = self._storage.GetHostById(id)
+            self._observer.deleteHost(ip, port)
+            self._state.deleteHost(ip, port)
+            self._storage.deleteHost(id)
+
+    def GetHosts(self):
+        with self._mutex:
+            return self._storage.GetHosts()
+
+    def GetHostState(self, id):
+        with self._mutex:
+            ip, port = self._storage.GetHostById(id)
+            return self._state.GetHostState(ip, port)
+
+    def FindHostById(self, id):
+        with self._mutex:
+            if self._storage.GetHostById(id) is None:
+                return False
+            return True
+
+    def FindHost(self, ip, port):
+        with self._mutex:
+            if self._storage.GetIdByHost(ip, port) is None:
+                return False
+            return True
 
 def main():
-    hosts = get_hosts(get_args())
-
-    storage = ConnectionStateStorage(hosts)
-
-    observer = ConnectionObserver(hosts)
-    observer.start( storage.SetHostState )
-
-    connections = ConnectionResource(storage)
-    connections_id = ConnectionIdResource(storage)
+    healthChecker = HealthChecker()
+    connections = ConnectionResource(healthChecker)
+    connections_id = ConnectionIdResource(healthChecker)
 
     api = falcon.API()
     api.add_route('/connections/', connections)
+    api.add_route('/connections/add', connections)
+    api.add_route('/connections/delete', connections)
     api.add_route('/connections/{connection_id}', connections_id)
-    
-    serve(api, host='127.0.0.1', port=5555)
 
-    observer.stop()
+    healthChecker.start()
+
+    ip, port = get_address(get_args())
+    serve(api, host=ip, port=port)
+
+    healthChecker.stop()
 
 if __name__ == "__main__":
     main()
